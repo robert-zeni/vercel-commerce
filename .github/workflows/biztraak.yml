@@ -1,0 +1,188 @@
+name: Biztraak Pipeline
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    tags-ignore:
+      - '*'
+  pull_request:
+    branches:
+      - main
+jobs:
+  preflight_validation:
+    name: preflight-validation
+    runs-on: ubuntu-latest
+    container:
+      image: alpine:latest
+    env:
+      CI_COMMIT_SHA: "${{ github.sha }}"
+      CI_COMMIT_SHORT_SHA: "${{ github.sha }}"
+      CI_COMMIT_REF_NAME: "${{ github.ref_name }}"
+      CI_COMMIT_REF_SLUG: "${{ github.ref_name }}"
+      CI_COMMIT_BRANCH: "${{ github.ref_name }}"
+      CI_PIPELINE_ID: "${{ github.run_id }}"
+      CI_PIPELINE_SOURCE: "${{ github.event_name }}"
+      CI_JOB_NAME: "${{ github.job }}"
+      CI_JOB_URL: "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+      CI_PROJECT_PATH: "${{ github.repository }}"
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
+      GCP_SA_KEY_B64: ${{ secrets.GCP_SA_KEY_B64 }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Before Script 1
+        run: apk add --no-cache curl jq bash grep
+      - name: Script 1
+        run: |
+          echo '=== Preflight Validation ==='
+          FAILED=0
+          echo ''
+          echo '--- Build Dependency Introspection ---'
+
+          # Check for Node.js projects requiring authentication
+          PACKAGE_JSON="./package.json"
+          if [ -f "$PACKAGE_JSON" ]; then
+            echo 'Found package.json - checking for private packages...'
+
+            # Check for private npm registry
+            if grep -qE '"@[a-z0-9-]+/|registry\.npmjs\.org.*:_auth' "$PACKAGE_JSON" 2>/dev/null; then
+              echo '  [INFO] Private npm scope or registry detected'
+              if [ -z "${NPM_TOKEN:-}" ]; then
+                echo '  [WARN] Private npm registry found but NPM_TOKEN is not set - build may fail'
+              else
+                echo '  [OK] NPM_TOKEN is set'
+              fi
+            fi
+
+            # Check for GitHub packages
+            if grep -qE 'npm\.pkg\.github\.com' "$PACKAGE_JSON" 2>/dev/null || [ -f "./.npmrc" ] && grep -qE 'npm\.pkg\.github\.com' "./.npmrc" 2>/dev/null; then
+              echo '  [INFO] GitHub Packages registry detected'
+              if [ -z "${GITHUB_TOKEN:-}" ] && [ -z "${NPM_TOKEN:-}" ]; then
+                echo '  [WARN] GitHub Packages found but GITHUB_TOKEN or NPM_TOKEN is not set'
+              else
+                echo '  [OK] GitHub token is set'
+              fi
+            fi
+          else
+            echo 'No package.json found in .'
+          fi
+
+          # Check Dockerfile for credential usage patterns
+          DOCKERFILE="./Dockerfile"
+          if [ -f "$DOCKERFILE" ]; then
+            echo 'Checking Dockerfile for credential patterns...'
+
+            # Check for nova login command
+            if grep -qE 'nova\s+login|composer\s+config.*nova\.laravel\.com' "$DOCKERFILE" 2>/dev/null; then
+              echo '  [INFO] Nova authentication command found in Dockerfile'
+              if [ -z "${NOVA_USERNAME:-}" ] || [ -z "${NOVA_LICENSE_KEY:-}" ]; then
+                if [ -z "${COMPOSER_AUTH:-}" ]; then
+                  echo '  [FAIL] Dockerfile uses Nova but credentials are not configured'
+                  FAILED=1
+                fi
+              fi
+            fi
+
+            # Check for --mount=type=secret patterns (BuildKit secrets)
+            # These require the secret to be passed via --secret flag in docker build, not --build-arg
+            # IMPORTANT: Variables used in secret mounts MUST be marked as 'protected' in Biztraak
+            echo '  Checking for BuildKit secret mounts...'
+            MOUNT_SECRETS=$(grep -oE '\-\-mount=type=secret,id=([A-Za-z0-9_]+)' "$DOCKERFILE" 2>/dev/null | sed 's/.*id=//' | sort -u || true)
+            if [ -n "$MOUNT_SECRETS" ]; then
+              echo '  [INFO] Dockerfile uses BuildKit secret mounts:'
+              for SECRET_ID in $MOUNT_SECRETS; do
+                echo "    - $SECRET_ID"
+                eval "SECRET_VAL=\${$SECRET_ID:-}"
+                if [ -z "$SECRET_VAL" ]; then
+                  echo "  [FAIL] Secret '$SECRET_ID' is required by Dockerfile but not set"
+                  FAILED=1
+                else
+                  # Validate JSON structure for COMPOSER_AUTH
+                  if [ "$SECRET_ID" = "COMPOSER_AUTH" ]; then
+                    if echo "$SECRET_VAL" | jq -e . >/dev/null 2>&1; then
+                      echo "  [OK] $SECRET_ID is set and contains valid JSON"
+                    else
+                      echo "  [FAIL] $SECRET_ID is set but contains invalid JSON"
+                      echo "         BuildKit secret mount expects valid JSON for auth.json"
+                      FAILED=1
+                    fi
+                  else
+                    echo "  [OK] $SECRET_ID is set"
+                  fi
+                fi
+              done
+              echo ''
+              echo '  [NOTE] Variables used with --mount=type=secret MUST be marked as protected in Biztraak.'
+              echo '         If not protected, they are passed as --build-arg (not --secret) and the build will fail.'
+            fi
+
+            # Check for ARG/ENV usage of common secrets
+            for SECRET in COMPOSER_AUTH NOVA_USERNAME NOVA_LICENSE_KEY NPM_TOKEN GITHUB_TOKEN; do
+              if grep -qE "(ARG|ENV)\s+$SECRET" "$DOCKERFILE" 2>/dev/null; then
+                eval "VAL=\${$SECRET:-}"
+                if [ -z "$VAL" ]; then
+                  echo "  [WARN] Dockerfile references $SECRET but it is not set"
+                else
+                  echo "  [OK] $SECRET is set (used in Dockerfile)"
+                fi
+              fi
+            done
+          fi
+          echo ''
+          echo '--- Database Connectivity Check ---'
+          echo '  [SKIP] No database dependency detected in component dependencies.'
+          echo ''
+          echo '=== Preflight Summary ==='
+          if [ $FAILED -eq 1 ]; then echo '[FAILED] One or more preflight checks failed. Fix the issues above before proceeding.'; exit 1; fi
+          echo '[PASSED] All preflight checks passed.'
+  build_ci:
+    name: build_ci
+    runs-on: ubuntu-latest
+    needs:
+      - preflight_validation
+    container:
+      image: node:20-bullseye
+    env:
+      CI_COMMIT_SHA: "${{ github.sha }}"
+      CI_COMMIT_SHORT_SHA: "${{ github.sha }}"
+      CI_COMMIT_REF_NAME: "${{ github.ref_name }}"
+      CI_COMMIT_REF_SLUG: "${{ github.ref_name }}"
+      CI_COMMIT_BRANCH: "${{ github.ref_name }}"
+      CI_PIPELINE_ID: "${{ github.run_id }}"
+      CI_PIPELINE_SOURCE: "${{ github.event_name }}"
+      CI_JOB_NAME: "${{ github.job }}"
+      CI_JOB_URL: "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+      CI_PROJECT_PATH: "${{ github.repository }}"
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
+      GCP_SA_KEY_B64: ${{ secrets.GCP_SA_KEY_B64 }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Before Script 1
+        run: apt-get update && apt-get install -y make g++ >/dev/null
+      - name: Before Script 2
+        run: |
+          if [ "0" = "1" ]; then
+            apt-get install -y python2 >/dev/null
+            ln -sf /usr/bin/python2 /usr/bin/python || true
+          fi
+      - name: Script 1
+        run: echo "Running Install Command..."
+      - name: Script 2
+        run: pnpm install
+      - name: Script 3
+        run: echo "Running Build Command..."
+      - name: Script 4
+        run: pnpm run build && pnpm exec next export
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build_ci-artifacts
+          path: |
+            out
+          retention-days: 1
