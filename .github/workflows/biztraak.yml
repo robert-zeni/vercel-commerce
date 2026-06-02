@@ -168,7 +168,7 @@ jobs:
       - name: Before Script 2
         run: corepack enable
       - name: Before Script 3
-        run:   corepack prepare pnpm@10 --activate
+        run: corepack prepare pnpm@10.12.4 --activate
       - name: Script 1
         run: echo "Running Install Command..."
       - name: Script 2
