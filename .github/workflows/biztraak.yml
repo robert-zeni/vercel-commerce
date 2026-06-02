@@ -166,6 +166,8 @@ jobs:
       - name: Before Script 1
         run: apt-get update && apt-get install -y make g++ >/dev/null
       - name: Before Script 2
+        run: corepack enable
+      - name: Before Script 3
         run: |
           if [ "0" = "1" ]; then
             apt-get install -y python2 >/dev/null
